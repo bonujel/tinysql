@@ -98,6 +98,44 @@ func DecodeRecordKey(key kv.Key) (tableID int64, handle int64, err error) {
 	 *   5. understanding the coding rules is a prerequisite for implementing this function,
 	 *      you can learn it in the projection 1-2 course documentation.
 	 */
+
+	// 保存原始 key 用于错误信息
+	k := key
+
+	// 1. 检查 key 长度是否足够
+	if len(key) < RecordRowKeyLen {
+		err = errInvalidRecordKey.GenWithStack("invalid record key - %q", k)
+		return
+	}
+
+	// 2. 检查并跳过 tablePrefix
+	if !key.HasPrefix(tablePrefix) {
+		err = errInvalidRecordKey.GenWithStack("invalid record key - %q", k)
+		return
+	}
+	key = key[tablePrefixLength:]
+
+	// 3. 解码 tableID
+	key, tableID, err = codec.DecodeInt(key)
+	if err != nil {
+		err = errInvalidRecordKey.GenWithStack("invalid record key - %q %v", k, err)
+		return
+	}
+
+	// 4. 检查并跳过 recordPrefixSep
+	if !key.HasPrefix(recordPrefixSep) {
+		err = errInvalidRecordKey.GenWithStack("invalid record key - %q", k)
+		return
+	}
+	key = key[recordPrefixSepLength:]
+
+	// 5. 解码 handle
+	_, handle, err = codec.DecodeInt(key)
+	if err != nil {
+		err = errInvalidRecordKey.GenWithStack("invalid record key - %q %v", k, err)
+		return
+	}
+
 	return
 }
 
@@ -148,6 +186,47 @@ func DecodeIndexKeyPrefix(key kv.Key) (tableID int64, indexID int64, indexValues
 	 *   5. understanding the coding rules is a prerequisite for implementing this function,
 	 *      you can learn it in the projection 1-2 course documentation.
 	 */
+
+	// 保存原始 key 用于错误信息
+	k := key
+
+	// 1. 检查 key 长度是否足够（至少要有 prefixLen）
+	if len(key) < prefixLen {
+		err = errInvalidIndexKey.GenWithStack("invalid index key - %q", k)
+		return
+	}
+
+	// 2. 检查并跳过 tablePrefix
+	if !key.HasPrefix(tablePrefix) {
+		err = errInvalidIndexKey.GenWithStack("invalid index key - %q", k)
+		return
+	}
+	key = key[tablePrefixLength:]
+
+	// 3. 解码 tableID
+	key, tableID, err = codec.DecodeInt(key)
+	if err != nil {
+		err = errInvalidIndexKey.GenWithStack("invalid index key - %q %v", k, err)
+		return
+	}
+
+	// 4. 检查并跳过 indexPrefixSep
+	if !key.HasPrefix(indexPrefixSep) {
+		err = errInvalidIndexKey.GenWithStack("invalid index key - %q", k)
+		return
+	}
+	key = key[len(indexPrefixSep):]
+
+	// 5. 解码 indexID
+	key, indexID, err = codec.DecodeInt(key)
+	if err != nil {
+		err = errInvalidIndexKey.GenWithStack("invalid index key - %q %v", k, err)
+		return
+	}
+
+	// 6. 剩余的部分就是 indexValues
+	indexValues = key
+
 	return tableID, indexID, indexValues, nil
 }
 
