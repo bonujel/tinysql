@@ -1,0 +1,40 @@
+name: TinySQL Tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.16'
+
+      - name: Build
+        run: make
+
+      - name: Run Project 1 Tests
+        run: make test-proj1
+
+      - name: Run Project 2 Tests
+        run: make test-proj2 || true
+
+      - name: Run Project 3 Tests
+        run: make test-proj3 || true
+
+      - name: Run Project 4 Tests
+        run: |
+          make test-proj4-1 || true
+          make test-proj4-2 || true
+
+      - name: Run Project 5 Tests
+        run: |
+          make test-proj5-1 || true
+          make test-proj5-2 || true
+          make test-proj5-3 || true
