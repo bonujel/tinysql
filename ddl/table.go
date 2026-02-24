@@ -375,7 +375,21 @@ func updateVersionAndTableInfoWithCheck(t *meta.Meta, job *model.Job, tblInfo *m
  */
 func updateVersionAndTableInfo(t *meta.Meta, job *model.Job, tblInfo *model.TableInfo, shouldUpdateVer bool) (
 	ver int64, err error) {
-	// TODO complete this function.
+	// Step 1: Update schema version if needed
+	if shouldUpdateVer {
+		ver, err = updateSchemaVersion(t, job)
+		if err != nil {
+			return 0, errors.Trace(err)
+		}
+	}
 
-	return ver, errors.Trace(err)
+	// Step 2: Update table information
+	// Update the table's UpdateTS to current timestamp
+	tblInfo.UpdateTS = t.StartTS
+	err = t.UpdateTable(job.SchemaID, tblInfo)
+	if err != nil {
+		return 0, errors.Trace(err)
+	}
+
+	return ver, nil
 }
