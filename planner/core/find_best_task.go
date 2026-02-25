@@ -211,9 +211,63 @@ type candidatePath struct {
 // If `x` is not worse than `y` at all factors,
 // and there exists one factor that `x` is better than `y`, then `x` is better than `y`.
 func compareCandidates(lhs, rhs *candidatePath) int {
-	// Project 4-2: your code here
-	// TODO: implement the content according to the header comment.
-	return 0
+	// 比较三个维度：
+	// 1. 访问条件中涉及的列集合（越多越好）
+	// 2. 是否匹配物理属性（匹配更好）
+	// 3. 是否需要双扫描（单次扫描更好）
+
+	// 维度 1: 比较列集合
+	// 使用 SubsetOf 方法检查包含关系
+	lhsSubsetRhs := lhs.columnSet.SubsetOf(rhs.columnSet)
+	rhsSubsetLhs := rhs.columnSet.SubsetOf(lhs.columnSet)
+
+	var colCmp int
+	if rhsSubsetLhs && !lhsSubsetRhs {
+		colCmp = 1 // lhs 更好（包含更多列）
+	} else if lhsSubsetRhs && !rhsSubsetLhs {
+		colCmp = -1 // rhs 更好
+	} else {
+		colCmp = 0 // 不可比或相等
+	}
+
+	// 维度 2: 比较物理属性匹配
+	var propCmp int
+	if lhs.isMatchProp && !rhs.isMatchProp {
+		propCmp = 1 // lhs 更好
+	} else if !lhs.isMatchProp && rhs.isMatchProp {
+		propCmp = -1 // rhs 更好
+	} else {
+		propCmp = 0 // 相等
+	}
+
+	// 维度 3: 比较是否需要双扫描（isSingleScan 为 true 表示单次扫描，更好）
+	var scanCmp int
+	if lhs.isSingleScan && !rhs.isSingleScan {
+		scanCmp = 1 // lhs 更好（单次扫描）
+	} else if !lhs.isSingleScan && rhs.isSingleScan {
+		scanCmp = -1 // rhs 更好
+	} else {
+		scanCmp = 0 // 相等
+	}
+
+	// Skyline 判断：
+	// 如果 lhs 在所有维度都不比 rhs 差（>= 0），且至少有一个维度更好（> 0），则 lhs 支配 rhs
+	// 如果 rhs 在所有维度都不比 lhs 差（<= 0），且至少有一个维度更好（< 0），则 rhs 支配 lhs
+	// 否则不可比
+
+	if colCmp >= 0 && propCmp >= 0 && scanCmp >= 0 {
+		if colCmp > 0 || propCmp > 0 || scanCmp > 0 {
+			return 1 // lhs 支配 rhs
+		}
+	}
+
+	if colCmp <= 0 && propCmp <= 0 && scanCmp <= 0 {
+		if colCmp < 0 || propCmp < 0 || scanCmp < 0 {
+			return -1 // rhs 支配 lhs
+		}
+	}
+
+	return 0 // 不可比或完全相等
 }
 
 func (ds *DataSource) getTableCandidate(path *util.AccessPath, prop *property.PhysicalProperty) *candidatePath {
@@ -273,11 +327,25 @@ func (ds *DataSource) skylinePruning(prop *property.PhysicalProperty) []*candida
 			}
 		}
 
-		// Project 4-2: your code here
-		// TODO: Here is the pruning phase. Will prune the access path which is must worse than others.
-		//       You'll need to implement the content in function `compareCandidates`.
-		//       And use it to prune unnecessary paths.
-		candidates = append(candidates, currentCandidate)
+		// Skyline Pruning: 检查当前候选是否被已有候选支配
+		shouldPrune := false
+		for i := 0; i < len(candidates); i++ {
+			cmp := compareCandidates(candidates[i], currentCandidate)
+			if cmp > 0 {
+				// candidates[i] 支配 currentCandidate，剪枝掉 currentCandidate
+				shouldPrune = true
+				break
+			} else if cmp < 0 {
+				// currentCandidate 支配 candidates[i]，移除 candidates[i]
+				candidates = append(candidates[:i], candidates[i+1:]...)
+				i-- // 调整索引，因为删除了一个元素
+			}
+		}
+
+		// 如果当前候选没有被剪枝，添加到候选列表
+		if !shouldPrune {
+			candidates = append(candidates, currentCandidate)
+		}
 	}
 	return candidates
 }

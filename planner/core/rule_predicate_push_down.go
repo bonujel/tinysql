@@ -366,7 +366,44 @@ func (p *LogicalProjection) PredicatePushDown(predicates []expression.Expression
 // Hints:
 //   1. predicates need to be discussed in two types: expression.Constant and expression.ScalarFunction
 func (la *LogicalAggregation) PredicatePushDown(predicates []expression.Expression) (ret []expression.Expression, retPlan LogicalPlan) {
-	return predicates, la
+	// 分离可以下推和不能下推的谓词
+	canBePushed := make([]expression.Expression, 0, len(predicates))
+	canNotBePushed := make([]expression.Expression, 0, len(predicates))
+
+	// 获取子节点的 Schema
+	childSchema := la.children[0].Schema()
+
+	for _, cond := range predicates {
+		// 检查谓词的类型
+		switch cond.(type) {
+		case *expression.Constant:
+			// 常量谓词可以下推
+			canBePushed = append(canBePushed, cond)
+		case *expression.ScalarFunction:
+			// 对于标量函数，需要检查它引用的列是否都在子节点的 Schema 中
+			// 如果谓词只引用 GROUP BY 的列（即子节点的列），则可以下推
+			// 如果谓词引用了聚合函数的结果列，则不能下推
+			if expression.ExprFromSchema(cond, childSchema) {
+				// 谓词中的所有列都来自子节点，可以下推
+				canBePushed = append(canBePushed, cond)
+			} else {
+				// 谓词引用了聚合后的列（聚合函数结果），不能下推
+				canNotBePushed = append(canNotBePushed, cond)
+			}
+		default:
+			// 其他类型的表达式，保守处理，不下推
+			canNotBePushed = append(canNotBePushed, cond)
+		}
+	}
+
+	// 将可以下推的谓词传递给子节点
+	remained, child := la.children[0].PredicatePushDown(canBePushed)
+
+	// 更新子节点
+	la.children[0] = child
+
+	// 返回不能下推的谓词和子节点无法处理的谓词
+	return append(remained, canNotBePushed...), la
 }
 
 // PredicatePushDown implements LogicalPlan PredicatePushDown interface.

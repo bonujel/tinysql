@@ -49,7 +49,12 @@ func (c *CMSketch) InsertBytes(bytes []byte) {
 
 // insertBytesByCount adds the bytes value into the TopN (if value already in TopN) or CM Sketch by delta, this does not updates c.defaultValue.
 func (c *CMSketch) insertBytesByCount(bytes []byte, count uint64) {
-	// TODO: implement the insert method.
+	h1, h2 := murmur3.Sum128(bytes)
+	c.count += count
+	for i := range c.table {
+		j := (h1 + h2*uint64(i)) % uint64(c.width)
+		c.table[i][j] += uint32(count)
+	}
 }
 
 func (c *CMSketch) queryValue(sc *stmtctx.StatementContext, val types.Datum) (uint64, error) {
@@ -67,8 +72,34 @@ func (c *CMSketch) QueryBytes(d []byte) uint64 {
 }
 
 func (c *CMSketch) queryHashValue(h1, h2 uint64) uint64 {
-	// TODO: implement the query method.
-	return uint64(0)
+	vals := make([]uint32, c.depth)
+	min := uint32(^uint32(0)) // math.MaxUint32
+	for i := range c.table {
+		j := (h1 + h2*uint64(i)) % uint64(c.width)
+		if min > c.table[i][j] {
+			min = c.table[i][j]
+		}
+		noise := (c.count - uint64(c.table[i][j])) / (uint64(c.width) - 1)
+		if uint64(c.table[i][j]) < noise {
+			vals[i] = 0
+		} else {
+			vals[i] = c.table[i][j] - uint32(noise)
+		}
+	}
+	// 对 vals 排序
+	for i := 0; i < len(vals); i++ {
+		for j := i + 1; j < len(vals); j++ {
+			if vals[i] > vals[j] {
+				vals[i], vals[j] = vals[j], vals[i]
+			}
+		}
+	}
+	// 取中位数
+	res := vals[(c.depth-1)/2] + (vals[c.depth/2]-vals[(c.depth-1)/2])/2
+	if res > min {
+		res = min
+	}
+	return uint64(res)
 }
 
 // MergeCMSketch merges two CM Sketch.
