@@ -29,6 +29,7 @@ import (
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/set"
+	"github.com/spaolacci/murmur3"
 	"go.uber.org/zap"
 )
 
@@ -353,6 +354,32 @@ func (w *HashAggPartialWorker) updatePartialResult(ctx sessionctx.Context, sc *s
 // We only support parallel execution for single-machine, so process of encode and decode can be skipped.
 func (w *HashAggPartialWorker) shuffleIntermData(sc *stmtctx.StatementContext, finalConcurrency int) {
 	// TODO: implement the method body. Shuffle the data to final workers.
+	// 1. Collect all group keys from partialResultsMap
+	groupKeysMap := make(map[int64][]string, finalConcurrency)
+	for groupKey := range w.partialResultsMap {
+		// 2. Hash the group key to determine which final worker should receive it
+		finalWorkerIdx := int(murmur3.Sum32([]byte(groupKey))) % finalConcurrency
+		if groupKeysMap[int64(finalWorkerIdx)] == nil {
+			groupKeysMap[int64(finalWorkerIdx)] = make([]string, 0, 8)
+		}
+		groupKeysMap[int64(finalWorkerIdx)] = append(groupKeysMap[int64(finalWorkerIdx)], groupKey)
+	}
+
+	// 3. Send intermediate data to corresponding final workers
+	for finalWorkerIdx, groupKeys := range groupKeysMap {
+		if len(groupKeys) == 0 {
+			continue
+		}
+		intermData := &HashAggIntermData{
+			groupKeys:        groupKeys,
+			cursor:           0,
+			partialResultMap: make(aggPartialResultMapper, len(groupKeys)),
+		}
+		for _, groupKey := range groupKeys {
+			intermData.partialResultMap[groupKey] = w.partialResultsMap[groupKey]
+		}
+		w.outputChs[finalWorkerIdx] <- intermData
+	}
 }
 
 // getGroupKey evaluates the group items and args of aggregate functions.
@@ -423,7 +450,40 @@ func (w *HashAggFinalWorker) getPartialInput() (input *HashAggIntermData, ok boo
 
 func (w *HashAggFinalWorker) consumeIntermData(sctx sessionctx.Context) (err error) {
 	// TODO: implement the method body. This method consumes the data given by the partial workers.
-	return nil
+	// 1. Continuously receive intermediate data from partial workers
+	for {
+		intermData, ok := w.getPartialInput()
+		if !ok {
+			// No more data from partial workers
+			return nil
+		}
+
+		// 2. Merge the partial results from this intermediate data
+		for _, groupKey := range intermData.groupKeys {
+			// Add group key to the set
+			if !w.groupSet.Exist(groupKey) {
+				w.groupSet.Insert(groupKey)
+			}
+
+			// Get or create partial results for this group key
+			finalPartialResults, exists := w.partialResultMap[groupKey]
+			if !exists {
+				finalPartialResults = make([]aggfuncs.PartialResult, len(w.aggFuncs))
+				for i, af := range w.aggFuncs {
+					finalPartialResults[i] = af.AllocPartialResult()
+				}
+				w.partialResultMap[groupKey] = finalPartialResults
+			}
+
+			// Merge partial results from the intermediate data
+			intermPartialResults := intermData.partialResultMap[groupKey]
+			for i, af := range w.aggFuncs {
+				if err = af.MergePartialResult(sctx, intermPartialResults[i], finalPartialResults[i]); err != nil {
+					return err
+				}
+			}
+		}
+	}
 }
 
 func (w *HashAggFinalWorker) getFinalResult(sctx sessionctx.Context) {
