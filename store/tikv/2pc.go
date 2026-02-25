@@ -346,9 +346,26 @@ func (c *twoPhaseCommitter) keySize(key []byte) int {
 }
 
 func (c *twoPhaseCommitter) buildPrewriteRequest(batch batchKeys) *tikvrpc.Request {
-	var req *pb.PrewriteRequest
-	// YOUR CODE HERE (proj6).
-	panic("YOUR CODE HERE")
+	// 构建 Mutations 数组
+	mutations := make([]*pb.Mutation, 0, len(batch.keys))
+	for _, key := range batch.keys {
+		// 从 mutations map 中获取对应的 mutation
+		mutation, ok := c.mutations[string(key)]
+		if !ok {
+			// 如果找不到，说明有问题
+			continue
+		}
+		mutations = append(mutations, &mutation.Mutation)
+	}
+
+	// 构建 PrewriteRequest
+	req := &pb.PrewriteRequest{
+		Mutations:    mutations,
+		PrimaryLock:  c.primary(),
+		StartVersion: c.startTS,
+		LockTtl:      c.lockTTL,
+	}
+
 	return tikvrpc.NewRequest(tikvrpc.CmdPrewrite, req, pb.Context{})
 }
 
@@ -422,8 +439,19 @@ func (actionCommit) handleSingleBatch(c *twoPhaseCommitter, bo *Backoffer, batch
 	var sender *RegionRequestSender
 	var err error
 	// build and send the commit request
-	// YOUR CODE HERE (proj6).
-	panic("YOUR CODE HERE")
+	// 构建 Commit 请求
+	req := tikvrpc.NewRequest(tikvrpc.CmdCommit, &pb.CommitRequest{
+		StartVersion:  c.startTS,
+		Keys:          batch.keys,
+		CommitVersion: c.commitTS,
+	}, pb.Context{})
+
+	// 创建 sender 并发送请求
+	sender = NewRegionRequestSender(c.store.regionCache, c.store.client)
+	resp, err := sender.SendReq(bo, req, batch.region, readTimeoutShort)
+	if err != nil {
+		return errors.Trace(err)
+	}
 
 	// If we fail to receive response for the request that commits primary key, it will be undetermined whether this
 	// transaction has been successfully committed.
@@ -445,8 +473,34 @@ func (actionCommit) handleSingleBatch(c *twoPhaseCommitter, bo *Backoffer, batch
 	}
 
 	// handle the response and error refer to actionPrewrite.handleSingleBatch
-	// YOUR CODE HERE (proj6).
-	panic("YOUR CODE HERE")
+	// 处理 Region 错误
+	regionErr, err := resp.GetRegionError()
+	if err != nil {
+		return errors.Trace(err)
+	}
+	if regionErr != nil {
+		err = bo.Backoff(BoRegionMiss, errors.New(regionErr.String()))
+		if err != nil {
+			return errors.Trace(err)
+		}
+		// 重试 commit
+		err = c.commitKeys(bo, batch.keys)
+		return errors.Trace(err)
+	}
+
+	// 检查响应
+	if resp.Resp == nil {
+		return errors.Trace(ErrBodyMissing)
+	}
+
+	// 检查 Commit 响应中的错误
+	commitResp := resp.Resp.(*pb.CommitResponse)
+	if commitResp.Error != nil {
+		// 使用 extractKeyErr 转换错误类型，与 Prewrite 保持一致
+		// 能正确识别 Conflict（写写冲突）和 Retryable 错误
+		err := extractKeyErr(commitResp.Error)
+		return errors.Trace(err)
+	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -460,14 +514,47 @@ func (actionCleanup) handleSingleBatch(c *twoPhaseCommitter, bo *Backoffer, batc
 	// follow actionPrewrite.handleSingleBatch, build the rollback request
 
 	// build and send the rollback request
-	// YOUR CODE HERE (proj6).
-	panic("YOUR CODE HERE")
+	// 构建 BatchRollback 请求
+	req := tikvrpc.NewRequest(tikvrpc.CmdBatchRollback, &pb.BatchRollbackRequest{
+		StartVersion: c.startTS,
+		Keys:         batch.keys,
+	}, pb.Context{})
+
+	// 创建 sender 并发送请求
+	sender := NewRegionRequestSender(c.store.regionCache, c.store.client)
+	resp, err := sender.SendReq(bo, req, batch.region, readTimeoutShort)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
 	// handle the response and error refer to actionPrewrite.handleSingleBatch
+	// 处理 Region 错误
+	regionErr, err := resp.GetRegionError()
+	if err != nil {
+		return errors.Trace(err)
+	}
+	if regionErr != nil {
+		err = bo.Backoff(BoRegionMiss, errors.New(regionErr.String()))
+		if err != nil {
+			return errors.Trace(err)
+		}
+		// 重试 cleanup
+		err = c.cleanupKeys(bo, batch.keys)
+		return errors.Trace(err)
+	}
 
-	// YOUR CODE HERE (proj6).
-	panic("YOUR CODE HERE")
+	// 检查响应
+	if resp.Resp == nil {
+		return errors.Trace(ErrBodyMissing)
+	}
+
+	// 检查 BatchRollback 响应中的错误
+	rollbackResp := resp.Resp.(*pb.BatchRollbackResponse)
+	if rollbackResp.Error != nil {
+		return errors.Errorf("rollback failed: %v", rollbackResp.Error)
+	}
+
 	return nil
-
 }
 
 func (c *twoPhaseCommitter) prewriteKeys(bo *Backoffer, keys [][]byte) error {

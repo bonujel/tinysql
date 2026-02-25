@@ -200,6 +200,22 @@ func (lr *LockResolver) ResolveLocks(bo *Backoffer, callerStartTS uint64, locks 
 		} else {
 			// Update the txn expire time.
 			msBeforeLockExpired := lr.store.GetOracle().UntilExpired(l.TxnID, status.ttl)
+			if msBeforeLockExpired <= 0 {
+				// TTL 已过期但状态仍为活跃，直接尝试清理，避免空转重试。
+				status.ttl = 0
+				cleanRegions, exists := cleanTxns[l.TxnID]
+				if !exists {
+					cleanRegions = make(map[RegionVerID]struct{})
+					cleanTxns[l.TxnID] = cleanRegions
+				}
+				err = lr.resolveLock(bo, l, status, cleanRegions)
+				if err != nil {
+					msBeforeTxnExpired.update(0)
+					err = errors.Trace(err)
+					return msBeforeTxnExpired.value(), nil, err
+				}
+				continue
+			}
 			msBeforeTxnExpired.update(msBeforeLockExpired)
 			// In the write conflict scenes, callerStartTS is set to 0 to avoid unnecessary push minCommitTS operation.
 			if callerStartTS > 0 {
@@ -265,7 +281,7 @@ func (lr *LockResolver) getTxnStatusFromLock(bo *Backoffer, l *Lock, callerStart
 		return TxnStatus{}, err
 	}
 
-	rollbackIfNotExist := false
+	rollbackIfNotExist := true
 	for {
 		status, err = lr.getTxnStatus(bo, l.TxnID, l.Primary, callerStartTS, currentTS, rollbackIfNotExist)
 		if err == nil {
@@ -294,8 +310,13 @@ func (lr *LockResolver) getTxnStatus(bo *Backoffer, txnID uint64, primary []byte
 	var status TxnStatus
 	var req *tikvrpc.Request
 	// build the request
-	// YOUR CODE HERE (proj6).
-	panic("YOUR CODE HERE")
+	// 构建 CheckTxnStatus 请求
+	req = tikvrpc.NewRequest(tikvrpc.CmdCheckTxnStatus, &kvrpcpb.CheckTxnStatusRequest{
+		PrimaryKey: primary,
+		LockTs:     txnID,
+		CurrentTs:  currentTS,
+	}, kvrpcpb.Context{})
+
 	for {
 		loc, err := lr.store.GetRegionCache().LocateKey(bo, primary)
 		if err != nil {
@@ -319,11 +340,20 @@ func (lr *LockResolver) getTxnStatus(bo *Backoffer, txnID uint64, primary []byte
 		if resp.Resp == nil {
 			return status, errors.Trace(ErrBodyMissing)
 		}
-		_ = resp.Resp.(*kvrpcpb.CheckTxnStatusResponse)
+		cmdResp := resp.Resp.(*kvrpcpb.CheckTxnStatusResponse)
 
 		// Assign status with response
-		// YOUR CODE HERE (proj6).
-		panic("YOUR CODE HERE")
+		// 根据响应设置 status
+		status.action = cmdResp.Action
+		status.commitTS = cmdResp.CommitVersion
+		status.ttl = cmdResp.LockTtl
+
+		// 只缓存终态：已提交或已回滚（TTL=0）
+		// Action_NoAction 可能表示活跃锁（TTL>0）或已回滚（TTL=0），只缓存后者
+		if status.ttl == 0 && (status.IsCommitted() || status.action == kvrpcpb.Action_NoAction) {
+			lr.saveResolved(txnID, status)
+		}
+
 		return status, nil
 	}
 
@@ -334,49 +364,61 @@ func (lr *LockResolver) getTxnStatus(bo *Backoffer, txnID uint64, primary []byte
 // If status is not committed and the
 func (lr *LockResolver) resolveLock(bo *Backoffer, l *Lock, status TxnStatus, cleanRegions map[RegionVerID]struct{}) error {
 	cleanWholeRegion := l.TxnSize >= bigTxnThreshold
-	for {
-		loc, err := lr.store.GetRegionCache().LocateKey(bo, l.Key)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		if _, ok := cleanRegions[loc.Region]; ok {
-			return nil
-		}
-
-		var req *tikvrpc.Request
-
-		// build the request
-		// YOUR CODE HERE (proj6).
-		panic("YOUR CODE HERE")
-
-		resp, err := lr.store.SendReq(bo, req, loc.Region, readTimeoutShort)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		regionErr, err := resp.GetRegionError()
-		if err != nil {
-			return errors.Trace(err)
-		}
-		if regionErr != nil {
-			err = bo.Backoff(BoRegionMiss, errors.New(regionErr.String()))
+	resolveByKey := func(key []byte) error {
+		for {
+			loc, err := lr.store.GetRegionCache().LocateKey(bo, key)
 			if err != nil {
 				return errors.Trace(err)
 			}
-			continue
+			if _, ok := cleanRegions[loc.Region]; ok {
+				return nil
+			}
+
+			// 构建 ResolveLock 请求
+			resolveLockReq := &kvrpcpb.ResolveLockRequest{
+				StartVersion: l.TxnID,
+			}
+			if status.IsCommitted() {
+				resolveLockReq.CommitVersion = status.CommitTS()
+			}
+			req := tikvrpc.NewRequest(tikvrpc.CmdResolveLock, resolveLockReq, kvrpcpb.Context{})
+
+			resp, err := lr.store.SendReq(bo, req, loc.Region, readTimeoutShort)
+			if err != nil {
+				return errors.Trace(err)
+			}
+			regionErr, err := resp.GetRegionError()
+			if err != nil {
+				return errors.Trace(err)
+			}
+			if regionErr != nil {
+				err = bo.Backoff(BoRegionMiss, errors.New(regionErr.String()))
+				if err != nil {
+					return errors.Trace(err)
+				}
+				continue
+			}
+			if resp.Resp == nil {
+				return errors.Trace(ErrBodyMissing)
+			}
+			cmdResp := resp.Resp.(*kvrpcpb.ResolveLockResponse)
+			if keyErr := cmdResp.GetError(); keyErr != nil {
+				err = errors.Errorf("unexpected resolve err: %s, lock: %v", keyErr, l)
+				logutil.BgLogger().Error("resolveLock error", zap.Error(err))
+				return err
+			}
+			if cleanWholeRegion {
+				cleanRegions[loc.Region] = struct{}{}
+			}
+			return nil
 		}
-		if resp.Resp == nil {
-			return errors.Trace(ErrBodyMissing)
-		}
-		cmdResp := resp.Resp.(*kvrpcpb.ResolveLockResponse)
-		if keyErr := cmdResp.GetError(); keyErr != nil {
-			err = errors.Errorf("unexpected resolve err: %s, lock: %v", keyErr, l)
-			logutil.BgLogger().Error("resolveLock error", zap.Error(err))
-			return err
-		}
-		if cleanWholeRegion {
-			cleanRegions[loc.Region] = struct{}{}
-		}
-		return nil
 	}
 
+	// 先清理 primary 所在 region，避免只清掉 secondary 导致 primary 残留
+	if len(l.Primary) > 0 && !bytes.Equal(l.Primary, l.Key) {
+		if err := resolveByKey(l.Primary); err != nil {
+			return err
+		}
+	}
+	return resolveByKey(l.Key)
 }
